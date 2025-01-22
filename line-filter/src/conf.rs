@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::eval::eval_on_flat_hash;
 use crate::flatten::flatten_json;
@@ -66,28 +66,57 @@ impl Dispatcher {
             redis_clients: Arc::new(RwLock::new(Self::create_redis_clients(&config).await?)),
         });
 
-        let watcher_path = config_path.clone();
+        let watcher_path = std::path::Path::new(&config_path).parent().ok_or("Invalid config path")?.to_path_buf();
+
+        let config_file = std::path::Path::new(&config_path)
+            .file_name()
+            .ok_or("Invalid config filename")?
+            .to_str()
+            .ok_or("Invalid config filename")?
+            .to_string();
+
+        let dispatcher_clone = Arc::clone(&dispatcher);
+        let dispatcher_clone2 = Arc::clone(&dispatcher);
+
         let (tx, mut rx) = mpsc::channel(1);
+
+        // 启动文件监听
         tokio::spawn(async move {
+            let tx = tx.clone();
             let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    info!("catch notify event: {:?}", event);
-                    if event.kind.is_modify() {
-                        let _ = tx.try_send(());
-                        info!("config file changes, reload signal sent.");
+                    debug!("notified event: {:?}", event);
+                    if let notify::EventKind::Modify(_) = event.kind {
+                        // 检查是否是我们关注的配置文件
+                        for path in event.paths.iter() {
+                            if let Some(filename) = path.file_name() {
+                                if filename.to_string_lossy() == config_file {
+                                    let _ = tx.try_send(());
+                                    info!("config reloading event sent");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             })
             .unwrap();
-            info!("watching config file: {} ...", watcher_path);
-            watcher.watch(std::path::Path::new(&watcher_path), RecursiveMode::NonRecursive).unwrap();
+
+            // 监听整个目录
+            watcher.watch(&watcher_path, RecursiveMode::Recursive).unwrap();
+
+            // 保持 watcher 存活
+            info!("watching directory {:?} ...", watcher_path);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         });
 
-        let dispatcher_clone = Arc::clone(&dispatcher);
+        // 处理重载消息
         tokio::spawn(async move {
             let mut last_reload = Instant::now();
 
-            while rx.recv().await.is_some() {
+            while let Some(_) = rx.recv().await {
                 if last_reload.elapsed() < Duration::from_secs(1) {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -95,13 +124,10 @@ impl Dispatcher {
                 if let Err(e) = dispatcher_clone.reload_config().await {
                     error!("Failed to reload config: {}", e);
                 }
-                info!("config reloaded");
                 last_reload = Instant::now();
             }
         });
 
-        // 直接返回 Arc<Self>
-        let dispatcher_clone2 = Arc::clone(&dispatcher);
         Ok((*dispatcher_clone2).clone())
     }
 
