@@ -173,6 +173,26 @@ impl Dispatcher {
         Ok(())
     }
 
+    // 新增的过滤 JSON 的函数
+    fn filter_json_fields(flattened: &HashMap<String, Value>) -> Result<String, Box<dyn std::error::Error>> {
+        // Hard-coded fields to include
+        let fields_to_include = vec!["timestamp", "df", "icao24"];
+
+        // Create filtered JSON object with only specified fields
+        let filtered_json: Value = {
+            let mut filtered_map = serde_json::Map::new();
+            for field in &fields_to_include {
+                if let Some(value) = flattened.get(*field) {
+                    filtered_map.insert(field.to_string(), value.clone());
+                }
+            }
+            Value::Object(filtered_map)
+        };
+
+        // Serialize filtered JSON
+        Ok(serde_json::to_string(&filtered_json)?)
+    }
+
     pub async fn process_message(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
         let json: Value = serde_json::from_str(message)?;
         let mut flattened = HashMap::new();
@@ -188,9 +208,12 @@ impl Dispatcher {
                     let redis_url = rule.get_redis_url(&config.default.redis_url);
                     let redis_topic = rule.get_redis_topic(&config.default.redis_topic);
 
+                    // 只在需要发布时过滤 JSON
+                    let filtered_message = Self::filter_json_fields(&flattened)?;
+
                     if let Some(client) = clients.get(redis_url) {
                         let mut conn = client.get_multiplexed_async_connection().await?;
-                        let publish_result: RedisResult<String> = conn.publish(redis_topic, message).await;
+                        let publish_result: RedisResult<String> = conn.publish(redis_topic, &filtered_message).await;
                         if let Err(e) = publish_result {
                             error!("Failed to publish to redis ({}): {}", redis_url, e);
                         }
