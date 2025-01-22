@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn flatten_json(obj: &Value, prefix: &str, result: &mut HashMap<String, Value>) {
     match obj {
@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(result.get("data.numbers[0]").unwrap().as_i64().unwrap(), 1);
         assert_eq!(result.get("data.numbers[1]").unwrap().as_i64().unwrap(), 2);
         assert_eq!(result.get("data.numbers[2]").unwrap().as_i64().unwrap(), 3);
-        assert_eq!(result.get("data.active").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("data.active").unwrap().as_bool().unwrap());
         assert_eq!(result.get("data.details.note").unwrap().as_str().unwrap(), "test");
     }
 

@@ -1,8 +1,9 @@
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use redis::{AsyncCommands, RedisResult};
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::error;
-use redis::{AsyncCommands, RedisResult};
 
 use crate::eval::eval_on_flat_hash;
 use crate::flatten::flatten_json;
@@ -38,7 +39,6 @@ impl Rule {
     }
 }
 
-
 impl Config {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
@@ -55,12 +55,9 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let mut redis_clients = HashMap::new();
-        
+
         // 添加默认 Redis 客户端
-        redis_clients.insert(
-            config.default.redis_url.clone(),
-            redis::Client::open(config.default.redis_url.as_str())?
-        );
+        redis_clients.insert(config.default.redis_url.clone(), redis::Client::open(config.default.redis_url.as_str())?);
 
         // 添加规则中的 Redis 客户端（去重）
         for rule in &config.rules {
@@ -71,10 +68,7 @@ impl Dispatcher {
             }
         }
 
-        Ok(Self {
-            config,
-            redis_clients,
-        })
+        Ok(Self { config, redis_clients })
     }
 
     pub async fn process_message(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -94,9 +88,9 @@ impl Dispatcher {
                         if let Err(e) = publish_result {
                             error!("Failed to publish to redis ({}): {}", redis_url, e);
                         }
-                    }                    
+                    }
                 }
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => error!("Expression evaluation error: {}", e),
             }
         }
@@ -105,12 +99,11 @@ impl Dispatcher {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_config_loading() -> Result<(), Box<dyn std::error::Error>> {
