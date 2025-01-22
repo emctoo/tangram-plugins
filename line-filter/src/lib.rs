@@ -1,3 +1,4 @@
 pub mod conf;
-pub mod flatten;
 pub mod eval;
+pub mod flatten;
+pub mod unflatten;

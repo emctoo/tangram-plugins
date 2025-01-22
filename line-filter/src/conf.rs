@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use evalexpr::EvalexprError;
 use notify::{RecursiveMode, Watcher};
 use redis::{AsyncCommands, RedisResult};
 use serde::Deserialize;
@@ -13,6 +14,7 @@ use tracing::{debug, error, info};
 
 use crate::eval::eval_on_flat_hash;
 use crate::flatten::flatten_json;
+use crate::unflatten::unflatten_json;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -31,6 +33,12 @@ pub struct Rule {
     pub expr: String,
     pub redis_url: Option<String>,
     pub redis_topic: Option<String>,
+
+    #[serde(default)]
+    pub include: Vec<String>, // 如果字段不存在则使用默认值（空 Vec）
+
+    #[serde(default)]
+    pub exclude: Vec<String>, // 如果字段不存在则使用默认值（空 Vec）
 }
 
 impl Rule {
@@ -173,24 +181,45 @@ impl Dispatcher {
         Ok(())
     }
 
-    // 新增的过滤 JSON 的函数
-    fn filter_json_fields(flattened: &HashMap<String, Value>) -> Result<String, Box<dyn std::error::Error>> {
-        // Hard-coded fields to include
-        let fields_to_include = vec!["timestamp", "df", "icao24"];
+    fn create_filtered_json(original: &HashMap<String, Value>, fields: &[String]) -> HashMap<String, Value> {
+        let mut filtered_map = HashMap::new();
+        for field in fields {
+            if let Some(value) = original.get(field) {
+                filtered_map.insert(field.clone(), value.clone());
+            }
+        }
+        filtered_map
+    }
 
-        // Create filtered JSON object with only specified fields
-        let filtered_json: Value = {
-            let mut filtered_map = serde_json::Map::new();
-            for field in &fields_to_include {
-                if let Some(value) = flattened.get(*field) {
-                    filtered_map.insert(field.to_string(), value.clone());
+    fn create_excluded_json(original: &HashMap<String, Value>, exclude_fields: &[String]) -> HashMap<String, Value> {
+        let mut filtered_map = HashMap::new();
+        'outer: for (key, value) in original {
+            // 检查当前键是否是被排除的键的前缀
+            for exclude in exclude_fields {
+                if key == exclude || key.starts_with(&format!("{}.", exclude)) {
+                    continue 'outer;
                 }
             }
-            Value::Object(filtered_map)
+            filtered_map.insert(key.clone(), value.clone());
+        }
+        filtered_map
+    }
+
+    fn filter_json_fields(flattened: &HashMap<String, Value>, rule: &Rule) -> Result<String, Box<dyn std::error::Error>> {
+        let filtered_map = if !rule.include.is_empty() {
+            // include 不为空，按照 include 列表过滤
+            Self::create_filtered_json(flattened, &rule.include)
+        } else if !rule.exclude.is_empty() {
+            // include 为空但 exclude 不为空，排除指定字段
+            Self::create_excluded_json(flattened, &rule.exclude)
+        } else {
+            // 两者都为空，使用原始数据
+            flattened.clone()
         };
 
-        // Serialize filtered JSON
-        Ok(serde_json::to_string(&filtered_json)?)
+        // 将过滤后的扁平 HashMap 重新构建为嵌套的 JSON
+        let unflattened = unflatten_json(&filtered_map);
+        Ok(serde_json::to_string(&unflattened)?)
     }
 
     pub async fn process_message(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -198,18 +227,16 @@ impl Dispatcher {
         let mut flattened = HashMap::new();
         flatten_json(&json, "", &mut flattened);
 
-        // 读取配置
         let config = self.config.read().await;
         let clients = self.redis_clients.read().await;
 
         for rule in &config.rules {
             match eval_on_flat_hash(&flattened, &rule.expr) {
                 Ok(result) if result => {
+                    let filtered_message = Self::filter_json_fields(&flattened, rule)?;
+
                     let redis_url = rule.get_redis_url(&config.default.redis_url);
                     let redis_topic = rule.get_redis_topic(&config.default.redis_topic);
-
-                    // 只在需要发布时过滤 JSON
-                    let filtered_message = Self::filter_json_fields(&flattened)?;
 
                     if let Some(client) = clients.get(redis_url) {
                         let mut conn = client.get_multiplexed_async_connection().await?;
@@ -220,6 +247,7 @@ impl Dispatcher {
                     }
                 }
                 Ok(_) => {}
+                Err(EvalexprError::VariableIdentifierNotFound(_)) => {} // no operator for this yet
                 Err(e) => error!("Expression evaluation error: {}", e),
             }
         }
@@ -231,6 +259,7 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Seek;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -238,19 +267,21 @@ mod tests {
     #[test]
     fn test_config_loading() -> Result<(), Box<dyn std::error::Error>> {
         let config_content = r#"
-            [default]
-            redis_url = "redis://localhost:6379"
-            redis_topic = "default-topic"
+               [default]
+               redis_url = "redis://localhost:6379"
+               redis_topic = "default-topic"
 
-            [[rules]]
-            expr = 'df == "21"'
-            redis_url = "redis://192.168.11.37:6379"
-            redis_topic = "just-a-topic"
+               [[rules]]
+               expr = 'df == "21"'
+               redis_url = "redis://192.168.11.37:6379"
+               redis_topic = "just-a-topic"
+               include = ["timestamp", "df", "icao24"]
 
-            [[rules]]
-            expr = "user.age > 20"
-            redis_topic = "adult-users"
-        "#;
+               [[rules]]
+               expr = "user.age > 20"
+               redis_topic = "adult-users"
+               include = ["timestamp", "icao24"]
+           "#;
 
         let mut temp_file = NamedTempFile::new()?;
         write!(temp_file, "{}", config_content)?;
@@ -265,11 +296,90 @@ mod tests {
         assert_eq!(rule.expr, r#"df == "21""#);
         assert_eq!(rule.redis_url.as_deref(), Some("redis://192.168.11.37:6379"));
         assert_eq!(rule.redis_topic.as_deref(), Some("just-a-topic"));
+        assert_eq!(rule.include, vec!["timestamp", "df", "icao24"]);
 
         let rule = &config.rules[1];
         assert_eq!(rule.expr, "user.age > 20");
         assert_eq!(rule.redis_url.as_deref(), None);
         assert_eq!(rule.redis_topic.as_deref(), Some("adult-users"));
+        assert_eq!(rule.include, vec!["timestamp", "icao24"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_json_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let input = json!({
+            "user": {
+                "name": "John",
+                "age": 30,
+                "address": {
+                    "city": "New York",
+                    "zip": "10001"
+                }
+            },
+            "timestamp": "2024-01-22T10:00:00"
+        });
+
+        let mut flattened = HashMap::new();
+        flatten_json(&input, "", &mut flattened);
+
+        // 测试 include 过滤
+        let rule_with_include = Rule {
+            expr: "true".to_string(),
+            redis_url: None,
+            redis_topic: None,
+            include: vec!["user.name".to_string(), "user.address.city".to_string()],
+            exclude: vec![],
+        };
+
+        let result = Dispatcher::filter_json_fields(&flattened, &rule_with_include)?;
+        let filtered: Value = serde_json::from_str(&result)?;
+        let expected = json!({
+            "user": {
+                "name": "John",
+                "address": {
+                    "city": "New York"
+                }
+            }
+        });
+        assert_eq!(filtered, expected);
+
+        // 测试 exclude 过滤
+        let rule_with_exclude = Rule {
+            expr: "true".to_string(),
+            redis_url: None,
+            redis_topic: None,
+            include: vec![],
+            exclude: vec!["user.address".to_string()],
+        };
+
+        let result = Dispatcher::filter_json_fields(&flattened, &rule_with_exclude)?;
+        let filtered: Value = serde_json::from_str(&result)?;
+
+        println!("Filtered JSON with exclude: {}", serde_json::to_string_pretty(&filtered)?);
+
+        let expected = json!({
+            "user": {
+                "name": "John",
+                "age": 30
+            },
+            "timestamp": "2024-01-22T10:00:00"
+        });
+        assert_eq!(filtered, expected);
+
+        // 测试全部保留（include 和 exclude 都为空）
+        let rule_keep_all = Rule {
+            expr: "true".to_string(),
+            redis_url: None,
+            redis_topic: None,
+            include: vec![],
+            exclude: vec![],
+        };
+
+        let result = Dispatcher::filter_json_fields(&flattened, &rule_keep_all)?;
+        let filtered: Value = serde_json::from_str(&result)?;
+        assert_eq!(filtered, input);
 
         Ok(())
     }
@@ -280,6 +390,8 @@ mod tests {
             expr: "test".to_string(),
             redis_url: None,
             redis_topic: None,
+            include: vec![],
+            exclude: vec![],
         };
 
         assert_eq!(rule.get_redis_url("default_url"), "default_url");
@@ -289,6 +401,8 @@ mod tests {
             expr: "test".to_string(),
             redis_url: Some("custom_url".to_string()),
             redis_topic: Some("custom_topic".to_string()),
+            include: vec![],
+            exclude: vec![],
         };
 
         assert_eq!(rule.get_redis_url("default_url"), "custom_url");
