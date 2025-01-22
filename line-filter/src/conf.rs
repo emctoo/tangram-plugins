@@ -1,26 +1,28 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use redis::{AsyncCommands, RedisResult};
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::error;
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
 use crate::eval::eval_on_flat_hash;
 use crate::flatten::flatten_json;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub default: DefaultConfig,
     pub rules: Vec<Rule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DefaultConfig {
     pub redis_url: String,
     pub redis_topic: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Rule {
     pub expr: String,
     pub redis_url: Option<String>,
@@ -28,12 +30,10 @@ pub struct Rule {
 }
 
 impl Rule {
-    // 获取实际使用的 redis_url，如果没有配置则使用默认值
     pub fn get_redis_url<'a>(&'a self, default: &'a str) -> &'a str {
         self.redis_url.as_deref().unwrap_or(default)
     }
 
-    // 获取实际使用的 redis_topic，如果没有配置则使用默认值
     pub fn get_redis_topic<'a>(&'a self, default: &'a str) -> &'a str {
         self.redis_topic.as_deref().unwrap_or(default)
     }
@@ -48,12 +48,24 @@ impl Config {
 }
 
 pub struct Dispatcher {
-    config: Config,
-    redis_clients: HashMap<String, redis::Client>,
+    config_path: String,
+    config: Arc<RwLock<Config>>,
+    redis_clients: Arc<RwLock<HashMap<String, redis::Client>>>,
 }
 
 impl Dispatcher {
-    pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(config_path: String, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let redis_clients = Self::create_redis_clients(&config).await?;
+
+        Ok(Self {
+            config_path,
+            config: Arc::new(RwLock::new(config)),
+            redis_clients: Arc::new(RwLock::new(redis_clients)),
+        })
+    }
+
+    // 创建Redis客户端的辅助方法
+    async fn create_redis_clients(config: &Config) -> Result<HashMap<String, redis::Client>, Box<dyn std::error::Error>> {
         let mut redis_clients = HashMap::new();
 
         // 添加默认 Redis 客户端
@@ -68,7 +80,30 @@ impl Dispatcher {
             }
         }
 
-        Ok(Self { config, redis_clients })
+        Ok(redis_clients)
+    }
+
+    // 重新加载配置
+    pub async fn reload_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Reloading configuration from {}", self.config_path);
+
+        // 加载新配置
+        let new_config = Config::load(&self.config_path)?;
+
+        // 创建新的Redis客户端
+        let new_clients = Self::create_redis_clients(&new_config).await?;
+
+        // 更新配置和客户端
+        {
+            let mut config = self.config.write().await;
+            let mut clients = self.redis_clients.write().await;
+
+            *config = new_config;
+            *clients = new_clients;
+        }
+
+        info!("Configuration reloaded successfully");
+        Ok(())
     }
 
     pub async fn process_message(&self, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,13 +111,17 @@ impl Dispatcher {
         let mut flattened = HashMap::new();
         flatten_json(&json, "", &mut flattened);
 
-        for rule in &self.config.rules {
+        // 读取配置
+        let config = self.config.read().await;
+        let clients = self.redis_clients.read().await;
+
+        for rule in &config.rules {
             match eval_on_flat_hash(&flattened, &rule.expr) {
                 Ok(result) if result => {
-                    let redis_url = rule.get_redis_url(&self.config.default.redis_url);
-                    let redis_topic = rule.get_redis_topic(&self.config.default.redis_topic);
+                    let redis_url = rule.get_redis_url(&config.default.redis_url);
+                    let redis_topic = rule.get_redis_topic(&config.default.redis_topic);
 
-                    if let Some(client) = self.redis_clients.get(redis_url) {
+                    if let Some(client) = clients.get(redis_url) {
                         let mut conn = client.get_multiplexed_async_connection().await?;
                         let publish_result: RedisResult<String> = conn.publish(redis_topic, message).await;
                         if let Err(e) = publish_result {
@@ -102,6 +141,7 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Seek;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -113,7 +153,7 @@ mod tests {
             redis_topic = "default-topic"
 
             [[rules]]
-            expr = "df == \"21\""
+            expr = 'df == "21"'
             redis_url = "redis://192.168.11.37:6379"
             redis_topic = "just-a-topic"
 
@@ -132,7 +172,7 @@ mod tests {
         assert_eq!(config.rules.len(), 2);
 
         let rule = &config.rules[0];
-        assert_eq!(rule.expr, "df == \"21\"");
+        assert_eq!(rule.expr, r#"df == "21""#);
         assert_eq!(rule.redis_url.as_deref(), Some("redis://192.168.11.37:6379"));
         assert_eq!(rule.redis_topic.as_deref(), Some("just-a-topic"));
 
@@ -163,5 +203,62 @@ mod tests {
 
         assert_eq!(rule.get_redis_url("default_url"), "custom_url");
         assert_eq!(rule.get_redis_topic("default_topic"), "custom_topic");
+    }
+
+    #[tokio::test]
+    async fn test_config_reload() -> Result<(), Box<dyn std::error::Error>> {
+        // 创建临时配置文件
+        let mut temp_file = NamedTempFile::new()?;
+        let initial_config = r#"
+               [default]
+               redis_url = "redis://localhost:6379"
+               redis_topic = "default-topic"
+
+               [[rules]]
+               expr = "value == 1"
+               redis_topic = "topic-1"
+           "#;
+        write!(temp_file, "{}", initial_config)?;
+
+        // 创建 Dispatcher
+        let config = Config::load(temp_file.path().to_str().unwrap())?;
+        let dispatcher = Dispatcher::new(temp_file.path().to_str().unwrap().to_string(), config).await?;
+
+        // 验证初始配置
+        {
+            let config = dispatcher.config.read().await;
+            assert_eq!(config.rules.len(), 1);
+            assert_eq!(config.rules[0].expr, "value == 1");
+        }
+
+        // 重写配置文件内容
+        let new_config = r#"
+               [default]
+               redis_url = "redis://localhost:6379"
+               redis_topic = "default-topic"
+
+               [[rules]]
+               expr = "value == 1"
+               redis_topic = "topic-1"
+
+               [[rules]]
+               expr = "value == 2"
+               redis_topic = "topic-2"
+           "#;
+        temp_file.rewind()?;
+        std::io::Write::write_all(&mut temp_file, new_config.as_bytes())?;
+        temp_file.flush()?;
+
+        // 重新加载配置
+        dispatcher.reload_config().await?;
+
+        // 验证新配置
+        {
+            let config = dispatcher.config.read().await;
+            assert_eq!(config.rules.len(), 2);
+            assert_eq!(config.rules[1].expr, "value == 2");
+        }
+
+        Ok(())
     }
 }

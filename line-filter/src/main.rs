@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse(); // 解析命令行参数
     let config = Config::load(&args.config)?; // 加载配置
-    let dispatcher = Dispatcher::new(config).await?;
+    let dispatcher = Dispatcher::new("/home/maple/rust/line-filter/config.toml".into(), config).await?;
 
     for line in reader.lines() {
         let line = line?;
