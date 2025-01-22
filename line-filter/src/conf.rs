@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
+use notify::{RecursiveMode, Watcher};
 use redis::{AsyncCommands, RedisResult};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
 use tracing::{error, info};
 
 use crate::eval::eval_on_flat_hash;
@@ -47,6 +51,7 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Dispatcher {
     config_path: String,
     config: Arc<RwLock<Config>>,
@@ -55,13 +60,49 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub async fn new(config_path: String, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let redis_clients = Self::create_redis_clients(&config).await?;
+        let dispatcher = Arc::new(Self {
+            config_path: config_path.clone(),
+            config: Arc::new(RwLock::new(config.clone())),
+            redis_clients: Arc::new(RwLock::new(Self::create_redis_clients(&config).await?)),
+        });
 
-        Ok(Self {
-            config_path,
-            config: Arc::new(RwLock::new(config)),
-            redis_clients: Arc::new(RwLock::new(redis_clients)),
-        })
+        let watcher_path = config_path.clone();
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    info!("catch notify event: {:?}", event);
+                    if event.kind.is_modify() {
+                        let _ = tx.try_send(());
+                        info!("config file changes, reload signal sent.");
+                    }
+                }
+            })
+            .unwrap();
+            info!("watching config file: {} ...", watcher_path);
+            watcher.watch(std::path::Path::new(&watcher_path), RecursiveMode::NonRecursive).unwrap();
+        });
+
+        let dispatcher_clone = Arc::clone(&dispatcher);
+        tokio::spawn(async move {
+            let mut last_reload = Instant::now();
+
+            while rx.recv().await.is_some() {
+                if last_reload.elapsed() < Duration::from_secs(1) {
+                    sleep(Duration::from_secs(1)).await;
+                }
+
+                if let Err(e) = dispatcher_clone.reload_config().await {
+                    error!("Failed to reload config: {}", e);
+                }
+                info!("config reloaded");
+                last_reload = Instant::now();
+            }
+        });
+
+        // 直接返回 Arc<Self>
+        let dispatcher_clone2 = Arc::clone(&dispatcher);
+        Ok((*dispatcher_clone2).clone())
     }
 
     // 创建Redis客户端的辅助方法
