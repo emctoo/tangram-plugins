@@ -16,7 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26" }
 tokio-stream = "0.1"
 
 tracing = "0.1"
@@ -25,15 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 # futures-util = { version = "0.3.30"}
 
-chrono = "*"
-
-# hex = "0.4.3"
 redis = { version = "0.28", features = ["tokio-comp"] }
-
 clap = { version = "4.5", features = ["color", "derive", "wrap_help", "env"] }
-dotenv = { version = "0.15" }
-rand = { version = "0.8" }
-itertools = "0.14"
 
 # https://github.com/ISibboI/evalexpr
 evalexpr = "12.0.2"
@@ -44,3 +36,8 @@ serde_json = "1.0"
 toml = "0.8"
 tempfile = "3.8" # 用于测试
 notify = "6.1"
+
+# https://github.com/jr-1991/evalexpr-jit
+# evalexpr_jit = "0.2.0"
+
+# https://github.com/Kixiron/rust-langdev
