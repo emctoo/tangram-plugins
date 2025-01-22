@@ -1,8 +1,9 @@
 use std::io::{self, BufRead};
-// use std::path::PathBuf;
 
 use clap::Parser;
 use tracing::error;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use line_filter::conf::{Config, Dispatcher};
@@ -10,23 +11,34 @@ use line_filter::conf::{Config, Dispatcher};
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// 配置文件路径
     #[arg(short, long, default_value = "config.toml", help = "config file name")]
     config_file: String,
+
+    #[arg(short, long, default_value = "line-filter.log", help = "log file path")]
+    log_file: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "", &args.log_file);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
         .with_span_events(FmtSpan::CLOSE)
+        .with_writer(file_appender)
+        .with_ansi(false);
+    let stdout_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
+        .with_span_events(FmtSpan::CLOSE)
         .with_writer(move || {
             struct Writer(std::io::Stdout);
             impl std::io::Write for Writer {
                 fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                    // 在每个输出前添加回车符
                     print!("\r");
                     self.0.write(buf)
                 }
@@ -35,13 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Writer(std::io::stdout())
-        })
-        .init();
+        });
+    tracing_subscriber::registry().with(env_filter).with(file_layer).with(stdout_layer).init();
 
     let stdin = io::stdin();
     let reader = stdin.lock();
 
-    let args = Args::parse(); // 解析命令行参数
     let config = Config::load(&args.config_file)?;
     let dispatcher = Dispatcher::new(args.config_file.to_string(), config).await?;
 
