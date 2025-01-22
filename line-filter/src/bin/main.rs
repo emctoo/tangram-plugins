@@ -185,52 +185,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&args.config)?;     // 加载配置  
     let dispatcher = Dispatcher::new(config).await?;
 
-    // let redis_url = "redis://192.168.11.37:6379";
-    // let redis_client = redis::Client::open(redis_url)?;
-    // let mut redis_conn = redis_client.get_multiplexed_async_connection().await.unwrap();
-    // let redis_topic = "just-a-topic";
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             break;
         }
-
         if let Err(e) = dispatcher.process_message(&line).await {
             error!("Error processing message: {}", e);
-        }
-    
-        /*
-        match serde_json::from_str::<Value>(&line) {
-            Ok(json) => {
-                let mut flattened = HashMap::new();
-                flatten_json(&json, "", &mut flattened);
-                // println!("{:?}", flattened);
-
-                // pretty print a hashmap
-                // println!("Flattened JSON:\r");
-                // flattened.iter().for_each(|(k, v)| {
-                //     if k == "df" {
-                //         println!("  {}: {:?}\r", k, v);
-                //     }
-                // });
-                // println!();
-
-                match eval_on_flat_hash(&flattened, r#"df == "21""#) {
-                    Ok(result) => {
-                        // println!("- df == 21  => {}\r\n", result);
-                        if result {
-                            let publish_result: RedisResult<String> = redis_conn.publish(redis_topic, line).await;
-                            if let Err(e) = publish_result {
-                                error!("fail to publish to redis: {}", e)
-                            }
-                        }
-                    }
-                    Err(e) => println!("Evaluation error: {}", e),
-                }
-            }
-            Err(e) => eprintln!("Error parsing JSON: {}", e),
-        }
-         */
+        }    
     }
 
     Ok(())
