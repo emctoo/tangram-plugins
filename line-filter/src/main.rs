@@ -1,6 +1,7 @@
 use std::io::{self, BufRead};
 
 use clap::Parser;
+use redis::{AsyncCommands, RedisResult};
 use tracing::error;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::prelude::*;
@@ -11,6 +12,15 @@ use line_filter::conf::{Config, Dispatcher};
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
+    #[arg(long, default_value = "line-filter", help = "app name")]
+    line_speed: bool,
+
+    #[arg(long, default_value = "redis://127.0.0.1:6379", help = "redis url, line speed mode only")]
+    redis_url: String,
+
+    #[arg(long, default_value = "line-speed", help = "redis topic, line speed mode only")]
+    redis_topic: String,
+
     #[arg(short, long, default_value = "config.toml", help = "config file name")]
     config_file: String,
 
@@ -21,6 +31,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.line_speed {
+        return line_speed(&args.redis_url, &args.redis_topic).await;
+    }
 
     let file_appender = RollingFileAppender::new(Rotation::DAILY, "", &args.log_file);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -63,6 +76,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Err(e) = dispatcher.process_message(&line).await {
             error!("Error processing message: {}", e);
+        }
+    }
+    Ok(())
+}
+
+/// Line seepd mode with just forwarding whatever received
+async fn line_speed(redis_url: &str, redis_topic: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let stdin = io::stdin();
+    let reader = stdin.lock();
+
+    let redis_client = redis::Client::open(redis_url)?;
+    let mut conn = redis_client.get_multiplexed_async_connection().await?;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            break;
+        }
+        let publish_result: RedisResult<String> = conn.publish(redis_topic, line).await;
+        if let Err(e) = publish_result {
+            error!("Failed to publish to redis ({}): {}", redis_url, e);
         }
     }
     Ok(())

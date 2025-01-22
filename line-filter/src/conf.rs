@@ -231,12 +231,24 @@ impl Dispatcher {
         let clients = self.redis_clients.read().await;
 
         for rule in &config.rules {
+            let redis_url = rule.get_redis_url(&config.default.redis_url);
+            let redis_topic = rule.get_redis_topic(&config.default.redis_topic);
+
+            // fast path
+            // if message.contains(r#""df":"17"#) {
+            //     if let Some(client) = clients.get(redis_url) {
+            //         let mut conn = client.get_multiplexed_async_connection().await?;
+            //         let publish_result: RedisResult<String> = conn.publish(redis_topic, message).await;
+            //         if let Err(e) = publish_result {
+            //             error!("Failed to publish to redis ({}): {}", redis_url, e);
+            //         }
+            //     }
+            //     continue;
+            // }
+
             match eval_on_flat_hash(&flattened, &rule.expr) {
                 Ok(result) if result => {
                     let filtered_message = Self::filter_json_fields(&flattened, rule)?;
-
-                    let redis_url = rule.get_redis_url(&config.default.redis_url);
-                    let redis_topic = rule.get_redis_topic(&config.default.redis_topic);
 
                     if let Some(client) = clients.get(redis_url) {
                         let mut conn = client.get_multiplexed_async_connection().await?;
