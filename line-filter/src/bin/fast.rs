@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -90,11 +91,20 @@ fn parse_match_pair(s: &str) -> Result<MatchPair, String> {
     })
 }
 
-fn extract_icao24(line: &str) -> Option<String> {
-    let icao_start = line.find(r#""icao24":""#)?;
-    let value_start = icao_start + 9;
+fn extract_string(line: &str, key: &str) -> Option<String> {
+    let key_pattern = format!(r#""{key}":""#);
+    let value_start = line.find(&key_pattern)? + key_pattern.len();
     let value_end = line[value_start..].find('"')?;
     Some(line[value_start..value_start + value_end].to_string())
+}
+
+fn extract_number<T: FromStr>(line: &str, key: &str) -> Option<T> {
+    let key_pattern = format!(r#""{key}":"#);
+    let value_start = line.find(&key_pattern)? + key_pattern.len();
+    let rest = &line[value_start..];
+    let value_end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
+    let value_str = &rest[..value_end];
+    value_str.parse::<T>().ok()
 }
 
 struct MatcherWithCache {
@@ -114,7 +124,6 @@ impl MatcherWithCache {
 
     async fn try_publish(&mut self, icao24: &str, line: &str, con: &mut redis::aio::MultiplexedConnection) -> RedisResult<()> {
         if self.matcher.rate_limit_ms == 0 {
-            // 无限制
             if evaluate_expression(line, &self.matcher.expression) {
                 let _ = con.publish::<&std::string::String, &str, ()>(&self.matcher.topic, line).await;
             }
@@ -271,7 +280,7 @@ fn evaluate_expression(text: &str, expr: &MatchExpression) -> bool {
 async fn main() -> RedisResult<()> {
     let cli = Cli::parse();
     let redis_client = redis::Client::open(cli.redis_url).unwrap();
-    let mut con = redis_client.get_multiplexed_async_connection().await?;
+    let mut conn = redis_client.get_multiplexed_async_connection().await?;
 
     let mut matchers: Vec<MatcherWithCache> = cli.matches.into_iter().map(MatcherWithCache::new).collect();
 
@@ -283,9 +292,9 @@ async fn main() -> RedisResult<()> {
         {
             let line = line.trim();
             if !line.is_empty() {
-                if let Some(icao24) = extract_icao24(line) {
+                if let Some(icao24) = extract_string(line, "icao24") {
                     for matcher in &mut matchers {
-                        let _ = matcher.try_publish(&icao24, line, &mut con).await;
+                        let _ = matcher.try_publish(&icao24, line, &mut conn).await;
                     }
                 }
             }
@@ -299,6 +308,38 @@ async fn main() -> RedisResult<()> {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+        fn test_extract_string() {
+            // 测试正常情况
+            let input = r#"{"icao":"ABC123","other":"xyz"}"#;
+            assert_eq!(extract_string(input, "icao"), Some("ABC123".to_string()));
+
+            // 测试key不存在的情况
+            assert_eq!(extract_string(input, "notexist"), None);
+
+            // 测试空值的情况
+            let input = r#"{"icao":"","other":"xyz"}"#;
+            assert_eq!(extract_string(input, "icao"), Some("".to_string()));
+        }
+
+        #[test]
+        fn test_extract_number() {
+            // 测试整数
+            let input = r#"{"value":123,"other":"xyz"}"#;
+            assert_eq!(extract_number::<i32>(input, "value"), Some(123));
+
+            // 测试浮点数
+            let input = r#"{"value":123.45,"other":"xyz"}"#;
+            assert_eq!(extract_number::<f64>(input, "value"), Some(123.45));
+
+            // 测试key不存在的情况
+            assert_eq!(extract_number::<i32>(input, "notexist"), None);
+
+            // 测试无效数字格式
+            let input = r#"{"value":"abc","other":"xyz"}"#;
+            assert_eq!(extract_number::<i32>(input, "value"), None);
+        }
 
     #[test]
     fn test_parse_match_pair_with_rate_limit() {
