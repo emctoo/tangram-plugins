@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead};
+use std::time::{Duration, Instant};
+
 use clap::Parser;
 use redis::{AsyncCommands, RedisResult};
 
@@ -8,11 +11,129 @@ struct Cli {
     #[arg(long, default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
 
-    #[arg(long, default_value = "line-speed")]
-    redis_topic: String,
+    #[arg(long = "match", value_parser = parse_match_pair)]
+    matches: Vec<MatchPair>,
+}
 
-    #[arg(long = "expr", value_parser = parse_expression)]
-    expressions: Vec<MatchExpression>,
+/// 单个缓存条目
+struct CacheEntry {
+    last_publish: Instant,
+    rate_limit: Duration,
+}
+
+/// 每个匹配表达式的缓存表
+struct PublishCache {
+    entries: HashMap<String, CacheEntry>,
+    rate_limit: Duration,
+}
+
+impl PublishCache {
+    fn new(rate_limit_ms: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            rate_limit: Duration::from_millis(rate_limit_ms),
+        }
+    }
+
+    fn can_publish(&mut self, icao24: &str) -> bool {
+        let now = Instant::now();
+        match self.entries.get(icao24) {
+            Some(entry) if now.duration_since(entry.last_publish) < self.rate_limit => false,
+            _ => {
+                self.entries.insert(
+                    icao24.to_string(),
+                    CacheEntry {
+                        last_publish: now,
+                        rate_limit: self.rate_limit,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| now.duration_since(entry.last_publish) < entry.rate_limit);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MatchPair {
+    expression: MatchExpression,
+    topic: String,
+    rate_limit_ms: u64,
+}
+
+fn parse_match_pair(s: &str) -> Result<MatchPair, String> {
+    // expr:::topic:::rate_limit_ms
+    let parts: Vec<&str> = s.split(":::").collect();
+    if parts.len() != 3 {
+        return Err("Invalid format. Expected 'expression:::topic:::rate_limit_ms'".to_string());
+    }
+
+    let expr_str = parts[0];
+    let topic = parts[1];
+    let rate_limit = parts[2].parse::<u64>().map_err(|_| "Invalid rate limit value".to_string())?;
+
+    if expr_str.trim().is_empty() {
+        return Err("Expression cannot be empty".to_string());
+    }
+    if topic.trim().is_empty() {
+        return Err("Topic cannot be empty".to_string());
+    }
+
+    Ok(MatchPair {
+        expression: parse_expression(expr_str)?,
+        topic: topic.trim().to_string(),
+        rate_limit_ms: rate_limit,
+    })
+}
+
+fn extract_icao24(line: &str) -> Option<String> {
+    let icao_start = line.find(r#""icao24":""#)?;
+    let value_start = icao_start + 9;
+    let value_end = line[value_start..].find('"')?;
+    Some(line[value_start..value_start + value_end].to_string())
+}
+
+struct MatcherWithCache {
+    matcher: MatchPair,
+    cache: PublishCache,
+    cleanup_counter: usize,
+}
+
+impl MatcherWithCache {
+    fn new(matcher: MatchPair) -> Self {
+        Self {
+            cache: PublishCache::new(matcher.rate_limit_ms),
+            matcher,
+            cleanup_counter: 0,
+        }
+    }
+
+    async fn try_publish(&mut self, icao24: &str, line: &str, con: &mut redis::aio::MultiplexedConnection) -> RedisResult<()> {
+        if self.matcher.rate_limit_ms == 0 {
+            // 无限制
+            if evaluate_expression(line, &self.matcher.expression) {
+                let _ = con.publish::<&std::string::String, &str, ()>(&self.matcher.topic, line).await;
+            }
+            return Ok(());
+        }
+
+        if evaluate_expression(line, &self.matcher.expression) && self.cache.can_publish(icao24) {
+            let _ = con.publish::<&std::string::String, &str, ()>(&self.matcher.topic, line).await;
+        }
+
+        // 每处理1000次检查是否需要清理缓存
+        self.cleanup_counter += 1;
+        if self.cleanup_counter >= 1000 {
+            self.cache.cleanup();
+            self.cleanup_counter = 0;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +146,7 @@ enum MatchExpression {
 
 fn parse_expression(s: &str) -> Result<MatchExpression, String> {
     let mut tokens = tokenize(s)?;
-    tokens.reverse(); // 反转令牌以便从前往后弹出
+    tokens.reverse();
     parse_expr(&mut tokens)
 }
 
@@ -34,7 +155,6 @@ fn tokenize(s: &str) -> Result<Vec<String>, String> {
     let mut chars: Vec<char> = s.chars().collect();
 
     while !chars.is_empty() {
-        // 跳过空白字符
         while chars.first().map_or(false, |c| c.is_whitespace()) {
             chars.remove(0);
         }
@@ -147,9 +267,88 @@ fn evaluate_expression(text: &str, expr: &MatchExpression) -> bool {
     }
 }
 
+#[tokio::main]
+async fn main() -> RedisResult<()> {
+    let cli = Cli::parse();
+    let redis_client = redis::Client::open(cli.redis_url).unwrap();
+    let mut con = redis_client.get_multiplexed_async_connection().await?;
+
+    let mut matchers: Vec<MatcherWithCache> = cli.matches.into_iter().map(MatcherWithCache::new).collect();
+
+    let mut line = String::new();
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+
+    while handle.read_line(&mut line).unwrap() > 0 {
+        {
+            let line = line.trim();
+            if !line.is_empty() {
+                if let Some(icao24) = extract_icao24(line) {
+                    for matcher in &mut matchers {
+                        let _ = matcher.try_publish(&icao24, line, &mut con).await;
+                    }
+                }
+            }
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    #[test]
+    fn test_parse_match_pair_with_rate_limit() {
+        let result = parse_match_pair("(AND error critical):::error-topic:::5").unwrap();
+        assert_eq!(result.topic, "error-topic");
+        assert_eq!(result.rate_limit_ms, 5);
+    }
+
+    #[test]
+    fn test_publish_cache_with_different_limits() {
+        let mut cache1 = PublishCache::new(1_000); // 1秒限制
+        let mut cache2 = PublishCache::new(2_000); // 2秒限制
+
+        // 测试不同的速率限制
+        assert!(cache1.can_publish("test123"));
+        assert!(cache2.can_publish("test123"));
+
+        // 立即尝试
+        assert!(!cache1.can_publish("test123"));
+        assert!(!cache2.can_publish("test123"));
+
+        // 等待1秒
+        thread::sleep(Duration::from_secs(1));
+        assert!(cache1.can_publish("test123")); // cache1应该可以发布
+        assert!(!cache2.can_publish("test123")); // cache2还不能发布
+
+        // 再等待1秒
+        thread::sleep(Duration::from_secs(1));
+        assert!(cache2.can_publish("test123")); // cache2现在可以发布
+    }
+
+    #[test]
+    fn test_publish_cache() {
+        let mut cache = PublishCache::new(1_000);
+
+        assert!(cache.can_publish("test123")); // 第一次应该可以发布
+        assert!(!cache.can_publish("test123")); // 立即尝试应该被限制
+        assert!(cache.can_publish("other456")); // 不同的 icao24 应该可以发布
+
+        // 等待超过限制时间后应该可以再次发布
+        thread::sleep(Duration::from_millis(1_000));
+        assert!(cache.can_publish("test123"));
+    }
+
+    #[test]
+    fn test_invalid_match_pair() {
+        assert!(parse_match_pair("(AND error critical)").is_err());
+        assert!(parse_match_pair(":::topic").is_err());
+        assert!(parse_match_pair("expr:::").is_err());
+    }
 
     #[test]
     fn test_simple_text() {
@@ -224,35 +423,4 @@ mod tests {
             _ => panic!("Expected And expression"),
         }
     }
-}
-
-#[tokio::main]
-async fn main() -> RedisResult<()> {
-    let cli = Cli::parse();
-    let redis_client = redis::Client::open(cli.redis_url).unwrap();
-    let mut con = redis_client.get_multiplexed_async_connection().await?;
-
-    let mut line = String::new();
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-
-    while handle.read_line(&mut line).unwrap() > 0 {
-        {
-        let line = line.trim();
-        if !line.is_empty() {
-            let mut matched = false;
-            for expr in &cli.expressions {
-                if evaluate_expression(line, expr) {
-                    matched = true;
-                    break;
-                }
-            }
-            if matched {
-                let _: RedisResult<()> = con.publish(cli.redis_topic.clone(), line).await;
-            }
-        }
-        }
-        line.clear();
-    }
-    Ok(())
 }
