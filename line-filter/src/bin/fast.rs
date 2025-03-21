@@ -1,19 +1,30 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use futures_util::StreamExt;
 use redis::{AsyncCommands, RedisResult};
+use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    #[arg(long)]
+    file: Option<String>,
+
     #[arg(long, default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
 
     #[arg(long = "match", value_parser = parse_match_pair)]
     matches: Vec<MatchPair>,
+
+    #[arg(long, default_value = "from:streaming:bound-box")]
+    boundbox_channel: String,
 }
 
 /// 单个缓存条目
@@ -122,7 +133,19 @@ impl MatcherWithCache {
         }
     }
 
-    async fn try_publish(&mut self, icao24: &str, line: &str, con: &mut redis::aio::MultiplexedConnection) -> RedisResult<()> {
+    async fn try_publish(
+        &mut self, icao24: &str, line: &str, con: &mut redis::aio::MultiplexedConnection, bbox: &Option<BoundBox>,
+    ) -> RedisResult<()> {
+        // Only check bound box if we have one
+        if let Some(bbox) = bbox {
+            if let Some((lat, lon)) = extract_location(line) {
+                if !bbox.contains(lat, lon) {
+                    return Ok(()); // Skip if outside the bound box
+                }
+            }
+        }
+
+        // Rest of the function remains the same
         if self.matcher.rate_limit_ms == 0 {
             if evaluate_expression(line, &self.matcher.expression) {
                 let _ = con.publish::<&std::string::String, &str, ()>(&self.matcher.topic, line).await;
@@ -276,30 +299,99 @@ fn evaluate_expression(text: &str, expr: &MatchExpression) -> bool {
     }
 }
 
+/// example: {"northEastLat":52.37519176634675,"northEastLng":20.324707031250004,"southWestLat":42.63346775063901,"southWestLng":-11.18408203125}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BoundBox {
+    #[serde(rename = "northEastLat")]
+    north_east_lat: f64,
+    
+    #[serde(rename = "northEastLng")]
+    north_east_lng: f64,
+    
+    #[serde(rename = "southWestLat")]
+    south_west_lat: f64,
+    
+    #[serde(rename = "southWestLng")]
+    south_west_lng: f64,
+}
+
+impl Default for BoundBox {
+    fn default() -> Self {
+        // Global default bound box (entire world)
+        Self {
+            north_east_lat: 90.0,
+            south_west_lat: -90.0,
+            north_east_lng: 180.0,
+            south_west_lng: -180.0,
+        }
+    }
+}
+
+impl BoundBox {
+    fn contains(&self, lat: f64, lon: f64) -> bool {
+        lat <= self.north_east_lat && 
+        lat >= self.south_west_lat && 
+        lon <= self.north_east_lng && 
+        lon >= self.south_west_lng
+    }
+}
+
+async fn start_boundbox_subscriber(redis_url: String, channel: String, tx: watch::Sender<Option<BoundBox>>) -> RedisResult<()> {
+    let client = redis::Client::open(redis_url)?;
+    let mut pubsub = client.get_async_pubsub().await?;
+    pubsub.subscribe(channel).await?;
+
+    tokio::spawn(async move {
+        let mut stream = pubsub.on_message();
+        while let Some(msg) = stream.next().await {
+            let payload: String = msg.get_payload().unwrap_or_default();
+            if let Ok(new_bbox) = serde_json::from_str::<BoundBox>(&payload) {
+                let _ = tx.send(Some(new_bbox)); // Send as Some               
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn extract_location(line: &str) -> Option<(f64, f64)> {
+    let lat = extract_number::<f64>(line, "latitude")?;
+    let lon = extract_number::<f64>(line, "longitude")?;
+    Some((lat, lon))
+}
+
 #[tokio::main]
 async fn main() -> RedisResult<()> {
     let cli = Cli::parse();
-    let redis_client = redis::Client::open(cli.redis_url).unwrap();
+    let redis_client = redis::Client::open(cli.redis_url.clone()).unwrap();
     let mut conn = redis_client.get_multiplexed_async_connection().await?;
+
+    // Create the bound box watch channel with None as initial value
+    let (bbox_tx, bbox_rx) = watch::channel(None);
+
+    // Start the bound box subscriber in the background
+    start_boundbox_subscriber(cli.redis_url.clone(), cli.boundbox_channel, bbox_tx).await?;
 
     let mut matchers: Vec<MatcherWithCache> = cli.matches.into_iter().map(MatcherWithCache::new).collect();
 
-    let mut line = String::new();
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
+    let reader: Box<dyn BufRead> = match cli.file.as_deref() {
+        Some("-") | None => Box::new(BufReader::new(io::stdin())),
+        Some(file) => Box::new(BufReader::new(File::open(file).unwrap())),
+    };
 
-    while handle.read_line(&mut line).unwrap() > 0 {
-        {
-            let line = line.trim();
-            if !line.is_empty() {
-                if let Some(icao24) = extract_string(line, "icao24") {
-                    for matcher in &mut matchers {
-                        let _ = matcher.try_publish(&icao24, line, &mut conn).await;
-                    }
+    let bbox_rx = Arc::new(bbox_rx);
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let line = line.trim();
+        if !line.is_empty() {
+            if let Some(icao24) = extract_string(line, "icao24") {
+                // Get the latest bound box for filtering (now it's Option<BoundBox>)
+                let current_bbox = bbox_rx.borrow().clone();
+                for matcher in &mut matchers {
+                    let _ = matcher.try_publish(&icao24, line, &mut conn, &current_bbox).await;
                 }
             }
         }
-        line.clear();
     }
     Ok(())
 }
@@ -310,36 +402,36 @@ mod tests {
     use std::thread;
 
     #[test]
-        fn test_extract_string() {
-            // 测试正常情况
-            let input = r#"{"icao":"ABC123","other":"xyz"}"#;
-            assert_eq!(extract_string(input, "icao"), Some("ABC123".to_string()));
+    fn test_extract_string() {
+        // 测试正常情况
+        let input = r#"{"icao":"ABC123","other":"xyz"}"#;
+        assert_eq!(extract_string(input, "icao"), Some("ABC123".to_string()));
 
-            // 测试key不存在的情况
-            assert_eq!(extract_string(input, "notexist"), None);
+        // 测试key不存在的情况
+        assert_eq!(extract_string(input, "notexist"), None);
 
-            // 测试空值的情况
-            let input = r#"{"icao":"","other":"xyz"}"#;
-            assert_eq!(extract_string(input, "icao"), Some("".to_string()));
-        }
+        // 测试空值的情况
+        let input = r#"{"icao":"","other":"xyz"}"#;
+        assert_eq!(extract_string(input, "icao"), Some("".to_string()));
+    }
 
-        #[test]
-        fn test_extract_number() {
-            // 测试整数
-            let input = r#"{"value":123,"other":"xyz"}"#;
-            assert_eq!(extract_number::<i32>(input, "value"), Some(123));
+    #[test]
+    fn test_extract_number() {
+        // 测试整数
+        let input = r#"{"value":123,"other":"xyz"}"#;
+        assert_eq!(extract_number::<i32>(input, "value"), Some(123));
 
-            // 测试浮点数
-            let input = r#"{"value":123.45,"other":"xyz"}"#;
-            assert_eq!(extract_number::<f64>(input, "value"), Some(123.45));
+        // 测试浮点数
+        let input = r#"{"value":123.45,"other":"xyz"}"#;
+        assert_eq!(extract_number::<f64>(input, "value"), Some(123.45));
 
-            // 测试key不存在的情况
-            assert_eq!(extract_number::<i32>(input, "notexist"), None);
+        // 测试key不存在的情况
+        assert_eq!(extract_number::<i32>(input, "notexist"), None);
 
-            // 测试无效数字格式
-            let input = r#"{"value":"abc","other":"xyz"}"#;
-            assert_eq!(extract_number::<i32>(input, "value"), None);
-        }
+        // 测试无效数字格式
+        let input = r#"{"value":"abc","other":"xyz"}"#;
+        assert_eq!(extract_number::<i32>(input, "value"), None);
+    }
 
     #[test]
     fn test_parse_match_pair_with_rate_limit() {

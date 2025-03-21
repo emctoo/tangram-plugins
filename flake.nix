@@ -63,12 +63,22 @@
             inputsFrom = builtins.attrValues self.checks;
             buildInputs = [
               rustToolchain
+
               pkgs.pkg-config
               pkgs.openssl
+
               pkgs.cargo-dist
               pkgs.redis
               pkgs.iredis
             ];
+            # Certain Rust tools won't work without this
+            # This can also be fixed by using oxalica/rust-overlay and specifying the rust-src extension
+            # See https://discourse.nixos.org/t/rust-src-not-found-and-other-misadventures-of-developing-rust-on-nixos/11570/3?u=samuela. for more details.
+            RUST_SRC_PATH =
+              "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+            PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+            OPENSSL_DIR = "${pkgs.openssl.dev}";
+            OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
             shellHook = ''
               export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold"
             '';
