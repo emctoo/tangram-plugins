@@ -23,8 +23,8 @@ struct Cli {
     #[arg(long = "match", value_parser = parse_match_pair)]
     matches: Vec<MatchPair>,
 
-    #[arg(long, default_value = "from:streaming:bound-box")]
-    boundbox_channel: String,
+    #[arg(long)]
+    boundbox_channel: Option<String>,
 }
 
 /// 单个缓存条目
@@ -304,13 +304,13 @@ fn evaluate_expression(text: &str, expr: &MatchExpression) -> bool {
 struct BoundBox {
     #[serde(rename = "northEastLat")]
     north_east_lat: f64,
-    
+
     #[serde(rename = "northEastLng")]
     north_east_lng: f64,
-    
+
     #[serde(rename = "southWestLat")]
     south_west_lat: f64,
-    
+
     #[serde(rename = "southWestLng")]
     south_west_lng: f64,
 }
@@ -329,10 +329,7 @@ impl Default for BoundBox {
 
 impl BoundBox {
     fn contains(&self, lat: f64, lon: f64) -> bool {
-        lat <= self.north_east_lat && 
-        lat >= self.south_west_lat && 
-        lon <= self.north_east_lng && 
-        lon >= self.south_west_lng
+        lat <= self.north_east_lat && lat >= self.south_west_lat && lon <= self.north_east_lng && lon >= self.south_west_lng
     }
 }
 
@@ -346,7 +343,7 @@ async fn start_boundbox_subscriber(redis_url: String, channel: String, tx: watch
         while let Some(msg) = stream.next().await {
             let payload: String = msg.get_payload().unwrap_or_default();
             if let Ok(new_bbox) = serde_json::from_str::<BoundBox>(&payload) {
-                let _ = tx.send(Some(new_bbox)); // Send as Some               
+                let _ = tx.send(Some(new_bbox)); // Send as Some
             }
         }
     });
@@ -368,9 +365,12 @@ async fn main() -> RedisResult<()> {
 
     // Create the bound box watch channel with None as initial value
     let (bbox_tx, bbox_rx) = watch::channel(None);
+    let bbox_rx = Arc::new(bbox_rx);
 
-    // Start the bound box subscriber in the background
-    start_boundbox_subscriber(cli.redis_url.clone(), cli.boundbox_channel, bbox_tx).await?;
+    // Start the bound box subscriber in the background only if channel is specified
+    if let Some(channel) = cli.boundbox_channel.clone() {
+        start_boundbox_subscriber(cli.redis_url.clone(), channel, bbox_tx).await?;
+    }
 
     let mut matchers: Vec<MatcherWithCache> = cli.matches.into_iter().map(MatcherWithCache::new).collect();
 
@@ -379,13 +379,12 @@ async fn main() -> RedisResult<()> {
         Some(file) => Box::new(BufReader::new(File::open(file).unwrap())),
     };
 
-    let bbox_rx = Arc::new(bbox_rx);
     for line_result in reader.lines() {
         let line = line_result?;
         let line = line.trim();
         if !line.is_empty() {
             if let Some(icao24) = extract_string(line, "icao24") {
-                // Get the latest bound box for filtering (now it's Option<BoundBox>)
+                // Only get the bound box if we're actually using it
                 let current_bbox = bbox_rx.borrow().clone();
                 for matcher in &mut matchers {
                     let _ = matcher.try_publish(&icao24, line, &mut conn, &current_bbox).await;
