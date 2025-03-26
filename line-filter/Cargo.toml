@@ -22,6 +22,10 @@ path = "src/bin/fast.rs"
 name = "streaming"
 path = "src/bin/streaming.rs"
 
+[[bin]]
+name = "plane"
+path = "src/bin/plane.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
