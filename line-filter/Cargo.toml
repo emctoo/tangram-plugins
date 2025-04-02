@@ -26,6 +26,10 @@ path = "src/bin/streaming.rs"
 name = "plane"
 path = "src/bin/plane.rs"
 
+[[bin]]
+name = "history"
+path = "src/bin/history.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -59,5 +63,11 @@ notify = "8"
 
 # https://github.com/Kixiron/rust-langdev
 
-rs1090 = { version = "0.4.4" }
+rs1090 = { version = "0.4.8" }
 openssl = { version = "0.10", features = ["vendored"] }
+
+# Add these lines to your dependencies section
+rusqlite = { version = "0.34.0", features = ["bundled"] }
+zip = "2.5.0"
+dirs = "6.0.0"
+dotenv = "0.15"
